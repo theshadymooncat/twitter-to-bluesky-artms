@@ -44,9 +44,12 @@ def fetch_tweets():
                 status_url = NITTER_BASE + a["href"].replace(NITTER_BASE, "")
                 try:
                     resp = requests.get(status_url, timeout=10)
+                    print(f"Fetching video from: {status_url}")
+                    print(f"Status page HTML snippet: {resp.text[:500]}")
                     status_soup = BeautifulSoup(resp.text, "html.parser")
                     # Look for mp4 source first
                     source = status_soup.find("source", {"type": "video/mp4"})
+                    print(f"Found video URL: {video_url}")
                     if source:
                         src = source.get("src", "")
                         if src.startswith("/"):
