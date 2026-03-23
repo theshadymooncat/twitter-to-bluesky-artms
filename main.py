@@ -47,6 +47,10 @@ def fetch_tweets():
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"
 })
                     print(f"Fetching video from: {status_url}")
+                    print(f"Status code: {resp.status_code}")
+                    print(f"Response length: {len(resp.text)}")
+                    print(f"Status page HTML snippet: {resp.text[:500]}")
+                    print(f"Fetching video from: {status_url}")
                     print(f"Status page HTML snippet: {resp.text[:500]}")
                     status_soup = BeautifulSoup(resp.text, "html.parser")
                     # Look for mp4 source first
