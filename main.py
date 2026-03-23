@@ -73,8 +73,14 @@ def fetch_tweets():
         # Detect video using RSS pattern
         for a in soup.find_all("a", href=True):
             if "/status/" in a["href"]:
-                tweet_path = a["href"].split("#")[0]
+                href = a["href"].split("#")[0]
 
+                    # Normalize to path only
+                    if href.startswith("http"):
+                    # Remove domain (nitter or twitter)
+                    tweet_path = "/" + href.split("/", 3)[3]
+else:
+    tweet_path = href
                 img = a.find("img")
                 if img:
                     src = img.get("src", "")
