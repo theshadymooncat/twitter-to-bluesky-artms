@@ -141,25 +141,136 @@ def fetch_tweets():
     return tweets
 
 
+BSKY_MAX_DURATION = 180        # 3 minutes in seconds
+BSKY_MAX_BYTES    = 100 * 1024 * 1024  # 100 MB
+BSKY_MAX_HEIGHT   = 1080
+
+
+def probe_video(path):
+    """Return (width, height, duration_seconds) for a local video file."""
+    try:
+        result = subprocess.run([
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-show_entries", "format=duration",
+            "-of", "json",
+            path
+        ], capture_output=True, timeout=30)
+        info = json.loads(result.stdout)
+        streams = info.get("streams", [{}])
+        fmt = info.get("format", {})
+        width    = int(streams[0].get("width",  0)) if streams else 0
+        height   = int(streams[0].get("height", 0)) if streams else 0
+        duration = float(fmt.get("duration", 0))
+        return width, height, duration
+    except Exception as e:
+        print(f"ffprobe failed: {e}")
+        return 0, 0, 0
+
+
+def transcode_video(src_path):
+    """
+    Re-encode src_path to meet Bluesky limits:
+      - max 1080p (scale down, keep aspect ratio)
+      - max 3 minutes
+      - target under 100 MB via bitrate cap
+    Returns path to the new file (caller must unlink both), or None on failure.
+    """
+    width, height, duration = probe_video(src_path)
+    print(f"Source: {width}x{height}, {duration:.1f}s")
+
+    out = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    out.close()
+
+    # Scale filter: only downscale when taller than 1080p.
+    # -2 keeps aspect ratio and ensures width is divisible by 2 (libx264 req).
+    if height > BSKY_MAX_HEIGHT:
+        scale_filter = f"scale=-2:{BSKY_MAX_HEIGHT}"
+        print(f"Downscaling to {BSKY_MAX_HEIGHT}p")
+    else:
+        scale_filter = "scale=trunc(iw/2)*2:trunc(ih/2)*2"  # ensure even dims
+
+    trim_duration = min(duration, BSKY_MAX_DURATION) if duration > 0 else BSKY_MAX_DURATION
+
+    # Estimate a safe video bitrate to stay under 100 MB total.
+    # Leave ~128 kbps headroom for audio.
+    safe_video_kbps = max(500, int((BSKY_MAX_BYTES * 8 / trim_duration) / 1000) - 128)
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
+        "-i", src_path,
+        "-t", str(trim_duration),
+        "-vf", scale_filter,
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "23",
+        "-maxrate", f"{safe_video_kbps}k",
+        "-bufsize", f"{safe_video_kbps * 2}k",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        out.name
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, timeout=300)
+    if result.returncode == 0:
+        size = os.path.getsize(out.name)
+        print(f"Transcoded: {size / 1024 / 1024:.1f} MB")
+        return out.name
+    else:
+        print(f"Transcode error: {result.stderr.decode()}")
+        os.unlink(out.name)
+        return None
+
+
 def download_video(url):
+    """
+    Download video from url. Re-encode if it exceeds Bluesky's limits
+    (1080p, 3 min, 100 MB). Returns path to a ready-to-upload .mp4, or None.
+    """
     try:
         tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
         tmp.close()
 
+        # Download raw stream first (no re-encode)
         result = subprocess.run([
             "ffmpeg", "-y",
             "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
             "-i", url,
             "-c", "copy",
-            "-t", "60",
             tmp.name
         ], capture_output=True, timeout=120)
 
-        if result.returncode == 0:
-            return tmp.name
-        else:
-            print(f"ffmpeg error: {result.stderr.decode()}")
+        if result.returncode != 0:
+            print(f"ffmpeg download error: {result.stderr.decode()}")
+            os.unlink(tmp.name)
             return None
+
+        # Check whether transcoding is needed
+        width, height, duration = probe_video(tmp.name)
+        size = os.path.getsize(tmp.name)
+        needs_transcode = (
+            height > BSKY_MAX_HEIGHT
+            or duration > BSKY_MAX_DURATION
+            or size > BSKY_MAX_BYTES
+        )
+
+        if needs_transcode:
+            print(
+                f"Exceeds limits ({width}x{height}, {duration:.1f}s, "
+                f"{size / 1024 / 1024:.1f} MB) — transcoding…"
+            )
+            transcoded = transcode_video(tmp.name)
+            os.unlink(tmp.name)
+            return transcoded
+        else:
+            print(
+                f"Within limits ({width}x{height}, {duration:.1f}s, "
+                f"{size / 1024 / 1024:.1f} MB) — using as-is"
+            )
+            return tmp.name
 
     except Exception as e:
         print(f"Download failed: {e}")
@@ -189,6 +300,24 @@ def parse_facets(text):
     return facets
 
 
+def upload_video_to_bsky(bsky, video_path):
+    """
+    Upload a video blob directly to the PDS via uploadBlob (simple method).
+    Returns (blob, width, height) on success, or (None, 0, 0) on failure.
+    """
+    try:
+        width, height, _ = probe_video(video_path)
+        with open(video_path, "rb") as f:
+            video_data = f.read()
+        upload = bsky.upload_blob(video_data)
+        print(f"Uploaded video ({len(video_data) / 1024 / 1024:.1f} MB)")
+        return upload.blob, width, height
+    except Exception as e:
+        print(f"Video upload error: {e}")
+        return None, 0, 0
+        return None, 0, 0
+
+
 def post_to_bluesky(text, images, video_url):
     try:
         bsky = Client()
@@ -200,12 +329,17 @@ def post_to_bluesky(text, images, video_url):
         if video_url:
             video_path = download_video(video_url)
             if video_path:
-                with open(video_path, "rb") as f:
-                    video_data = f.read()
+                blob, width, height = upload_video_to_bsky(bsky, video_path)
                 os.unlink(video_path)
-
-                upload = bsky.upload_blob(video_data)
-                embed = models.AppBskyEmbedVideo.Main(video=upload.blob)
+                if blob:
+                    embed_kwargs = {"video": blob}
+                    if width and height:
+                        embed_kwargs["aspect_ratio"] = models.AppBskyEmbedDefs.AspectRatio(
+                            width=width, height=height
+                        )
+                    embed = models.AppBskyEmbedVideo.Main(**embed_kwargs)
+                else:
+                    print("Video upload to Bluesky failed")
             else:
                 print("Video download failed")
 
@@ -227,6 +361,7 @@ def post_to_bluesky(text, images, video_url):
                     ]
                 )
 
+        print(f"Sending post with embed type: {type(embed).__name__ if embed else None}")
         bsky.send_post(
             text=text[:300],
             facets=facets if facets else None,
