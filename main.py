@@ -169,108 +169,71 @@ def probe_video(path):
         return 0, 0, 0
 
 
-def transcode_video(src_path):
-    """
-    Re-encode src_path to meet Bluesky limits:
-      - max 1080p (scale down, keep aspect ratio)
-      - max 3 minutes
-      - target under 100 MB via bitrate cap
-    Returns path to the new file (caller must unlink both), or None on failure.
-    """
-    width, height, duration = probe_video(src_path)
-    print(f"Source: {width}x{height}, {duration:.1f}s")
-
-    out = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-    out.close()
-
-    # Scale filter: only downscale when taller than 1080p.
-    # -2 keeps aspect ratio and ensures width is divisible by 2 (libx264 req).
-    if height > BSKY_MAX_HEIGHT:
-        scale_filter = f"scale=-2:{BSKY_MAX_HEIGHT}"
-        print(f"Downscaling to {BSKY_MAX_HEIGHT}p")
-    else:
-        scale_filter = "scale=trunc(iw/2)*2:trunc(ih/2)*2"  # ensure even dims
-
-    trim_duration = min(duration, BSKY_MAX_DURATION) if duration > 0 else BSKY_MAX_DURATION
-
-    # Estimate a safe video bitrate to stay under 100 MB total.
-    # Leave ~128 kbps headroom for audio.
-    safe_video_kbps = max(500, int((BSKY_MAX_BYTES * 8 / trim_duration) / 1000) - 128)
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
-        "-i", src_path,
-        "-t", str(trim_duration),
-        "-vf", scale_filter,
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "23",
-        "-maxrate", f"{safe_video_kbps}k",
-        "-bufsize", f"{safe_video_kbps * 2}k",
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-movflags", "+faststart",
-        out.name
-    ]
-
-    result = subprocess.run(cmd, capture_output=True, timeout=300)
-    if result.returncode == 0:
-        size = os.path.getsize(out.name)
-        print(f"Transcoded: {size / 1024 / 1024:.1f} MB")
-        return out.name
-    else:
-        print(f"Transcode error: {result.stderr.decode()}")
-        os.unlink(out.name)
-        return None
-
-
 def download_video(url):
     """
-    Download video from url. Re-encode if it exceeds Bluesky's limits
-    (1080p, 3 min, 100 MB). Returns path to a ready-to-upload .mp4, or None.
+    Download and transcode video to a Bluesky-compatible MP4 (libx264/aac).
+    Always re-encodes to ensure a clean MP4 regardless of source format (HLS,
+    MPEG-TS, etc.) and to enforce the 1080p/3min/100MB limits.
+    Returns path to a ready-to-upload .mp4, or None on failure.
     """
     try:
-        tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-        tmp.close()
+        out = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        out.close()
 
-        # Download raw stream first (no re-encode)
-        result = subprocess.run([
+        # Probe the source directly (works for HLS/HTTP URLs too)
+        width, height, duration = probe_video(url)
+        print(f"Source video: {width}x{height}, {duration:.1f}s")
+
+        # "1080p" means the SHORT side is at most 1080.
+        # For vertical video (height > width), the short side is width.
+        # For horizontal video (width > height), the short side is height.
+        # scale=-2:1080 fixes height → wrong for portrait (squashes width to ~607)
+        # scale=1080:-2 fixes width → correct for portrait
+        short_side = min(width, height) if width and height else 0
+        is_vertical = height > width
+
+        if short_side > BSKY_MAX_HEIGHT:
+            if is_vertical:
+                # Limit width (short side) to 1080, height scales proportionally
+                scale_filter = f"scale={BSKY_MAX_HEIGHT}:-2"
+                print(f"Vertical video — downscaling width to {BSKY_MAX_HEIGHT}px")
+            else:
+                # Limit height (short side) to 1080, width scales proportionally
+                scale_filter = f"scale=-2:{BSKY_MAX_HEIGHT}"
+                print(f"Horizontal video — downscaling height to {BSKY_MAX_HEIGHT}px")
+        else:
+            # Already within limits — just ensure even dimensions for libx264
+            scale_filter = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+
+        trim_duration = min(duration, BSKY_MAX_DURATION) if duration > 0 else BSKY_MAX_DURATION
+        safe_video_kbps = max(500, int((BSKY_MAX_BYTES * 8 / trim_duration) / 1000) - 128)
+
+        cmd = [
             "ffmpeg", "-y",
             "-protocol_whitelist", "file,http,https,tcp,tls,crypto",
             "-i", url,
-            "-c", "copy",
-            tmp.name
-        ], capture_output=True, timeout=120)
+            "-t", str(trim_duration),
+            "-vf", scale_filter,
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "23",
+            "-maxrate", f"{safe_video_kbps}k",
+            "-bufsize", f"{safe_video_kbps * 2}k",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-movflags", "+faststart",
+            out.name
+        ]
 
-        if result.returncode != 0:
-            print(f"ffmpeg download error: {result.stderr.decode()}")
-            os.unlink(tmp.name)
-            return None
-
-        # Check whether transcoding is needed
-        width, height, duration = probe_video(tmp.name)
-        size = os.path.getsize(tmp.name)
-        needs_transcode = (
-            height > BSKY_MAX_HEIGHT
-            or duration > BSKY_MAX_DURATION
-            or size > BSKY_MAX_BYTES
-        )
-
-        if needs_transcode:
-            print(
-                f"Exceeds limits ({width}x{height}, {duration:.1f}s, "
-                f"{size / 1024 / 1024:.1f} MB) — transcoding…"
-            )
-            transcoded = transcode_video(tmp.name)
-            os.unlink(tmp.name)
-            return transcoded
+        result = subprocess.run(cmd, capture_output=True, timeout=300)
+        if result.returncode == 0:
+            size = os.path.getsize(out.name)
+            print(f"Downloaded and encoded: {size / 1024 / 1024:.1f} MB")
+            return out.name
         else:
-            print(
-                f"Within limits ({width}x{height}, {duration:.1f}s, "
-                f"{size / 1024 / 1024:.1f} MB) — using as-is"
-            )
-            return tmp.name
+            print(f"ffmpeg error: {result.stderr.decode()}")
+            os.unlink(out.name)
+            return None
 
     except Exception as e:
         print(f"Download failed: {e}")
