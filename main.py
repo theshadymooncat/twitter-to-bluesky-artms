@@ -300,6 +300,40 @@ def parse_facets(text):
     return facets
 
 
+def get_image_dimensions(data):
+    """
+    Extract (width, height) from raw image bytes without any extra dependencies.
+    Supports JPEG and PNG, which covers all Twitter/Bluesky images.
+    Returns (0, 0) if dimensions can't be determined.
+    """
+    try:
+        # PNG: 8-byte signature, then IHDR chunk: 4-byte length, "IHDR", width, height
+        if data[:8] == b'\x89PNG\r\n\x1a\n':
+            import struct
+            w, h = struct.unpack('>II', data[16:24])
+            return w, h
+
+        # JPEG: scan for SOF markers (0xFFC0–0xFFC3, 0xFFC5–0xFFC7, etc.)
+        if data[:2] == b'\xff\xd8':
+            import struct
+            i = 2
+            while i < len(data) - 8:
+                if data[i] != 0xff:
+                    break
+                marker = data[i + 1]
+                # SOF markers that contain dimensions
+                if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                               0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                    h, w = struct.unpack('>HH', data[i + 5:i + 9])
+                    return w, h
+                # Skip this segment
+                seg_len = struct.unpack('>H', data[i + 2:i + 4])[0]
+                i += 2 + seg_len
+    except Exception:
+        pass
+    return 0, 0
+
+
 def upload_video_to_bsky(bsky, video_path):
     """
     Upload a video blob directly to the PDS via uploadBlob (simple method).
@@ -348,16 +382,24 @@ def post_to_bluesky(text, images, video_url):
             for url in images[:4]:
                 try:
                     resp = requests.get(url, timeout=10)
+                    # Read dimensions from the image bytes before uploading
+                    img_width, img_height = get_image_dimensions(resp.content)
                     blob = bsky.upload_blob(resp.content)
-                    image_blobs.append(blob.blob)
+                    image_blobs.append((blob.blob, img_width, img_height))
                 except Exception as e:
                     print(f"Image upload failed: {e}")
 
             if image_blobs:
                 embed = models.AppBskyEmbedImages.Main(
                     images=[
-                        models.AppBskyEmbedImages.Image(image=blob, alt="")
-                        for blob in image_blobs
+                        models.AppBskyEmbedImages.Image(
+                            image=blob,
+                            alt="",
+                            aspect_ratio=models.AppBskyEmbedDefs.AspectRatio(
+                                width=w, height=h
+                            ) if w and h else None,
+                        )
+                        for blob, w, h in image_blobs
                     ]
                 )
 
